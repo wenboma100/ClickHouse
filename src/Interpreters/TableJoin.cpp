@@ -233,9 +233,15 @@ void TableJoin::addJoinedColumnsAndCorrectNullability(ColumnsWithTypeAndName & c
         if (leftBecomeNullable(col.type))
             col.type = makeNullable(col.type);
 
+    std::unordered_map<String, DataTypePtr> type_map;
+    for (const auto & [name, type] : converted_right_types)
+        type_map[name] = type;
+
     for (const auto & col : columns_added_by_join)
     {
         auto res_type = col.type;
+        if (const auto it = type_map.find(col.name); it != type_map.end())
+            res_type = it->second;
 
         if (rightBecomeNullable(res_type))
             res_type = makeNullable(res_type);
