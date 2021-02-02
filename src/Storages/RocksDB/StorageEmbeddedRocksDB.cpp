@@ -45,10 +45,12 @@ namespace ErrorCodes
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
 
+using FieldVectorPtr = std::shared_ptr<FieldVector>;
+
 
 // returns keys may be filter by condition
 static bool traverseASTFilter(
-    const String & primary_key, const DataTypePtr & primary_key_type, const ASTPtr & elem, const PreparedSets & sets, FieldVector & res)
+    const String & primary_key, const DataTypePtr & primary_key_type, const ASTPtr & elem, const PreparedSets & sets, FieldVectorPtr & res)
 {
     const auto * function = elem->as<ASTFunction>();
     if (!function)
@@ -65,13 +67,9 @@ static bool traverseASTFilter(
     else if (function->name == "or")
     {
         // make sure every child has the key filter condition
-        FieldVector child_res;
         for (const auto & child : function->arguments->children)
-        {
-            if (!traverseASTFilter(primary_key, primary_key_type, child, sets, child_res))
+            if (!traverseASTFilter(primary_key, primary_key_type, child, sets, res))
                 return false;
-        }
-        res.insert(res.end(), child_res.begin(), child_res.end());
         return true;
     }
     else if (function->name == "equals" || function->name == "in")
@@ -110,7 +108,7 @@ static bool traverseASTFilter(
             prepared_set->checkColumnsNumber(1);
             const auto & set_column = *prepared_set->getSetElements()[0];
             for (size_t row = 0; row < set_column.size(); ++row)
-                res.push_back(set_column[row]);
+                res->push_back(set_column[row]);
             return true;
         }
         else
@@ -128,9 +126,9 @@ static bool traverseASTFilter(
             /// function->name == "equals"
             if (const auto * literal = value->as<ASTLiteral>())
             {
-                auto converted_field = convertFieldToType(literal->value, primary_key_type);
+                auto converted_field = convertFieldToType(literal->value, *primary_key_type);
                 if (!converted_field.isNull())
-                    res.push_back(literal->value);
+                    res->push_back(literal->value);
                 return true;
             }
         }
@@ -142,14 +140,14 @@ static bool traverseASTFilter(
 /** Retrieve from the query a condition of the form `key = 'key'`, `key in ('xxx_'), from conjunctions in the WHERE clause.
   * TODO support key like search
   */
-static std::pair<FieldVector, bool> getFilterKeys(const String & primary_key, const DataTypePtr & primary_key_type, const SelectQueryInfo & query_info)
+static std::pair<FieldVectorPtr, bool> getFilterKeys(
+    const String & primary_key, const DataTypePtr & primary_key_type, const SelectQueryInfo & query_info)
 {
     const auto & select = query_info.query->as<ASTSelectQuery &>();
     if (!select.where())
-    {
-        return std::make_pair(FieldVector{}, true);
-    }
-    FieldVector res;
+        return {{}, true};
+
+    FieldVectorPtr res = std::make_shared<FieldVector>();
     auto matched_keys = traverseASTFilter(primary_key, primary_key_type, select.where(), query_info.sets, res);
     return std::make_pair(res, !matched_keys);
 }
@@ -161,12 +159,14 @@ public:
     EmbeddedRocksDBSource(
         const StorageEmbeddedRocksDB & storage_,
         const StorageMetadataPtr & metadata_snapshot_,
+        FieldVectorPtr keys_,
         FieldVector::const_iterator begin_,
         FieldVector::const_iterator end_,
         const size_t max_block_size_)
         : SourceWithProgress(metadata_snapshot_->getSampleBlock())
         , storage(storage_)
         , metadata_snapshot(metadata_snapshot_)
+        , keys(std::move(keys_))
         , begin(begin_)
         , end(end_)
         , it(begin)
@@ -231,6 +231,7 @@ private:
     const StorageEmbeddedRocksDB & storage;
 
     const StorageMetadataPtr metadata_snapshot;
+    FieldVectorPtr keys;
     FieldVector::const_iterator begin;
     FieldVector::const_iterator end;
     FieldVector::const_iterator it;
@@ -287,7 +288,8 @@ Pipe StorageEmbeddedRocksDB::read(
         unsigned num_streams)
 {
     metadata_snapshot->check(column_names, getVirtuals(), getStorageID());
-    FieldVector keys;
+
+    FieldVectorPtr keys;
     bool all_scan = false;
 
     auto primary_key_data_type = metadata_snapshot->getSampleBlock().getByName(primary_key).type;
@@ -300,18 +302,16 @@ Pipe StorageEmbeddedRocksDB::read(
     }
     else
     {
-        if (keys.empty())
+        if (keys->empty())
             return {};
 
-        std::sort(keys.begin(), keys.end());
-        auto unique_iter = std::unique(keys.begin(), keys.end());
-        if (unique_iter != keys.end())
-            keys.erase(unique_iter, keys.end());
+        std::sort(keys->begin(), keys->end());
+        keys->erase(std::unique(keys->begin(), keys->end()), keys->end());
 
         Pipes pipes;
 
-        size_t num_keys = keys.size();
-        size_t num_threads = std::min(size_t(num_streams), keys.size());
+        size_t num_keys = keys->size();
+        size_t num_threads = std::min(size_t(num_streams), keys->size());
 
         assert(num_keys <= std::numeric_limits<uint32_t>::max());
         assert(num_threads <= std::numeric_limits<uint32_t>::max());
@@ -321,14 +321,15 @@ Pipe StorageEmbeddedRocksDB::read(
             size_t begin = num_keys * thread_idx / num_threads;
             size_t end = num_keys * (thread_idx + 1) / num_threads;
 
-            pipes.emplace_back(
-                std::make_shared<EmbeddedRocksDBSource>(*this, metadata_snapshot, keys.begin() + begin, keys.begin() + end, max_block_size));
+            pipes.emplace_back(std::make_shared<EmbeddedRocksDBSource>(
+                    *this, metadata_snapshot, keys, keys->begin() + begin, keys->begin() + end, max_block_size));
         }
         return Pipe::unitePipes(std::move(pipes));
     }
 }
 
-BlockOutputStreamPtr StorageEmbeddedRocksDB::write(const ASTPtr & /*query*/, const StorageMetadataPtr & metadata_snapshot, const Context & /*context*/)
+BlockOutputStreamPtr StorageEmbeddedRocksDB::write(
+    const ASTPtr & /*query*/, const StorageMetadataPtr & metadata_snapshot, const Context & /*context*/)
 {
     return std::make_shared<EmbeddedRocksDBBlockOutputStream>(*this, metadata_snapshot);
 }
