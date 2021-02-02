@@ -24,6 +24,7 @@
 #include <Interpreters/Set.h>
 #include <Interpreters/PreparedSets.h>
 #include <Interpreters/TreeRewriter.h>
+#include <Interpreters/convertFieldToType.h>
 
 #include <Poco/File.h>
 #include <Poco/Path.h>
@@ -46,7 +47,8 @@ namespace ErrorCodes
 
 
 // returns keys may be filter by condition
-static bool traverseASTFilter(const String & primary_key, const DataTypePtr & primary_key_type, const ASTPtr & elem, const PreparedSets & sets, FieldVector & res)
+static bool traverseASTFilter(
+    const String & primary_key, const DataTypePtr & primary_key_type, const ASTPtr & elem, const PreparedSets & sets, FieldVector & res)
 {
     const auto * function = elem->as<ASTFunction>();
     if (!function)
@@ -108,9 +110,7 @@ static bool traverseASTFilter(const String & primary_key, const DataTypePtr & pr
             prepared_set->checkColumnsNumber(1);
             const auto & set_column = *prepared_set->getSetElements()[0];
             for (size_t row = 0; row < set_column.size(); ++row)
-            {
                 res.push_back(set_column[row]);
-            }
             return true;
         }
         else
@@ -125,10 +125,12 @@ static bool traverseASTFilter(const String & primary_key, const DataTypePtr & pr
             if (ident->name() != primary_key)
                 return false;
 
-            //function->name == "equals"
+            /// function->name == "equals"
             if (const auto * literal = value->as<ASTLiteral>())
             {
-                res.push_back(literal->value);
+                auto converted_field = convertFieldToType(literal->value, primary_key_type);
+                if (!converted_field.isNull())
+                    res.push_back(literal->value);
                 return true;
             }
         }
@@ -159,23 +161,17 @@ public:
     EmbeddedRocksDBSource(
         const StorageEmbeddedRocksDB & storage_,
         const StorageMetadataPtr & metadata_snapshot_,
-        const FieldVector & keys_,
-        const size_t start_,
-        const size_t end_,
+        FieldVector::const_iterator begin_,
+        FieldVector::const_iterator end_,
         const size_t max_block_size_)
         : SourceWithProgress(metadata_snapshot_->getSampleBlock())
         , storage(storage_)
         , metadata_snapshot(metadata_snapshot_)
-        , start(start_)
+        , begin(begin_)
         , end(end_)
+        , it(begin)
         , max_block_size(max_block_size_)
     {
-        // slice the keys
-        if (end > start)
-        {
-            keys.resize(end - start);
-            std::copy(keys_.begin() + start, keys_.begin() + end, keys.begin());
-        }
     }
 
     String getName() const override
@@ -185,26 +181,31 @@ public:
 
     Chunk generate() override
     {
-        if (processed_keys >= keys.size() || (start == end))
+        size_t num_keys = end - begin;
+        if (num_keys == 0 && it >= end)
             return {};
 
         std::vector<rocksdb::Slice> slices_keys;
-        slices_keys.reserve(keys.size());
-        std::vector<String> values;
-        std::vector<WriteBufferFromOwnString> wbs(keys.size());
+        slices_keys.reserve(num_keys);
 
         const auto & sample_block = metadata_snapshot->getSampleBlock();
         const auto & key_column = sample_block.getByName(storage.primary_key);
         auto columns = sample_block.cloneEmptyColumns();
         size_t primary_key_pos = sample_block.getPositionByName(storage.primary_key);
 
-        for (size_t i = processed_keys; i < std::min(keys.size(), processed_keys + max_block_size); ++i)
+        size_t rows_processed = 0;
+        while (it < end && rows_processed < max_block_size)
         {
-            key_column.type->serializeBinary(keys[i], wbs[i]);
-            auto str_ref = wbs[i].stringRef();
+            WriteBufferFromOwnString wb;
+            key_column.type->serializeBinary(*it, wb);
+            auto str_ref = wb.stringRef();
             slices_keys.emplace_back(str_ref.data, str_ref.size);
+
+            ++it;
+            ++rows_processed;
         }
 
+        std::vector<String> values;
         auto statuses = storage.rocksdb_ptr->MultiGet(rocksdb::ReadOptions(), slices_keys, &values);
         for (size_t i = 0; i < statuses.size(); ++i)
         {
@@ -221,7 +222,6 @@ public:
                 }
             }
         }
-        processed_keys += max_block_size;
 
         UInt64 num_rows = columns.at(0)->size();
         return Chunk(std::move(columns), num_rows);
@@ -231,12 +231,10 @@ private:
     const StorageEmbeddedRocksDB & storage;
 
     const StorageMetadataPtr metadata_snapshot;
-    const size_t start;
-    const size_t end;
+    FieldVector::const_iterator begin;
+    FieldVector::const_iterator end;
+    FieldVector::const_iterator it;
     const size_t max_block_size;
-    FieldVector keys;
-
-    size_t processed_keys = 0;
 };
 
 
@@ -311,22 +309,20 @@ Pipe StorageEmbeddedRocksDB::read(
             keys.erase(unique_iter, keys.end());
 
         Pipes pipes;
-        size_t start = 0;
-        size_t end;
 
-        const size_t num_threads = std::min(size_t(num_streams), keys.size());
-        const size_t batch_per_size = ceil(keys.size() * 1.0 / num_threads);
+        size_t num_keys = keys.size();
+        size_t num_threads = std::min(size_t(num_streams), keys.size());
 
-        for (size_t t = 0; t < num_threads; ++t)
+        assert(num_keys <= std::numeric_limits<uint32_t>::max());
+        assert(num_threads <= std::numeric_limits<uint32_t>::max());
+
+        for (size_t thread_idx = 0; thread_idx < num_threads; ++thread_idx)
         {
-            if (start >= keys.size())
-                start = end = 0;
-            else
-                end = start + batch_per_size > keys.size() ? keys.size() : start + batch_per_size;
+            size_t begin = num_keys * thread_idx / num_threads;
+            size_t end = num_keys * (thread_idx + 1) / num_threads;
 
             pipes.emplace_back(
-                std::make_shared<EmbeddedRocksDBSource>(*this, metadata_snapshot, keys, start, end, max_block_size));
-            start += batch_per_size;
+                std::make_shared<EmbeddedRocksDBSource>(*this, metadata_snapshot, keys.begin() + begin, keys.begin() + end, max_block_size));
         }
         return Pipe::unitePipes(std::move(pipes));
     }
