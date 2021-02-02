@@ -18,5 +18,10 @@ SELECT * FROM test WHERE key IN (123, 456, -123) ORDER BY key;
 SELECT '--';
 SELECT * FROM test WHERE key = 'Hello'; -- { serverError 53 }
 
+DETACH TABLE test;
+ATTACH TABLE test;
+
+SELECT * FROM test WHERE key IN (99, 999, 9999, -123) ORDER BY key;
+
 DROP TABLE IF EXISTS test;
 
