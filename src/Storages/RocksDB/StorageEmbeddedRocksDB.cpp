@@ -182,7 +182,7 @@ public:
     Chunk generate() override
     {
         size_t num_keys = end - begin;
-        if (num_keys == 0 && it >= end)
+        if (num_keys == 0 || it >= end)
             return {};
 
         std::vector<rocksdb::Slice> slices_keys;
