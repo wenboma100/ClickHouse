@@ -181,12 +181,13 @@ public:
 
     Chunk generate() override
     {
-        size_t num_keys = end - begin;
-        if (num_keys == 0 || it >= end)
+        if (it >= end)
             return {};
 
-        std::vector<rocksdb::Slice> slices_keys;
-        slices_keys.reserve(num_keys);
+        size_t num_keys = end - begin;
+
+        std::vector<std::string> serialized_keys(num_keys);
+        std::vector<rocksdb::Slice> slices_keys(num_keys);
 
         const auto & sample_block = metadata_snapshot->getSampleBlock();
         const auto & key_column = sample_block.getByName(storage.primary_key);
@@ -196,10 +197,10 @@ public:
         size_t rows_processed = 0;
         while (it < end && rows_processed < max_block_size)
         {
-            WriteBufferFromOwnString wb;
+            WriteBufferFromString wb(serialized_keys[rows_processed]);
             key_column.type->serializeBinary(*it, wb);
-            auto str_ref = wb.stringRef();
-            slices_keys.emplace_back(str_ref.data, str_ref.size);
+            wb.finalize();
+            slices_keys[rows_processed] = std::move(serialized_keys[rows_processed]);
 
             ++it;
             ++rows_processed;
@@ -207,6 +208,7 @@ public:
 
         std::vector<String> values;
         auto statuses = storage.rocksdb_ptr->MultiGet(rocksdb::ReadOptions(), slices_keys, &values);
+
         for (size_t i = 0; i < statuses.size(); ++i)
         {
             if (statuses[i].ok())
